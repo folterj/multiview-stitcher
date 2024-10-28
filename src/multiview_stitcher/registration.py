@@ -72,16 +72,19 @@ def get_optimal_registration_binning(
       - sample physical space homogeneously
       - don't occupy too much memory
 
+    Implementation:
+      - input are two spatial images which already overlap
+      - start with binning of 1
+      - if total number of pixels in the stack is too large, double binning of the dimension
+        with smallest spacing (with x and y tied to each other)
     """
 
     spatial_dims = spatial_image_utils.get_spatial_dims_from_sim(sim1)
     ndim = len(spatial_dims)
-    spacings = [
+    input_spacings = [
         spatial_image_utils.get_spacing_from_sim(sim, asarray=False)
         for sim in [sim1, sim2]
     ]
-
-    registration_binning = {dim: 1 for dim in spatial_dims}
 
     if overlap_tolerance is not None:
         raise (NotImplementedError("overlap_tolerance"))
@@ -91,14 +94,14 @@ def get_optimal_registration_binning(
         for idim, dim in enumerate(spatial_dims)
     }
 
+    registration_binning = {dim: 1 for dim in spatial_dims}
+    spacings = input_spacings
     while (
         max(
             [
                 np.prod(
                     [
-                        overlap[dim]
-                        / spacings[isim][dim]
-                        / registration_binning[dim]
+                        overlap[dim] / registration_binning[dim]
                         for dim in spatial_dims
                     ]
                 )
@@ -115,14 +118,14 @@ def get_optimal_registration_binning(
         )
 
         if ndim == 3 and dim_to_bin == 0:
-            registration_binning["z"] = registration_binning["z"] * 2
+            registration_binning["z"] = registration_binning["z"] + 1
         else:
             for dim in ["x", "y"]:
-                registration_binning[dim] = registration_binning[dim] * 2
+                registration_binning[dim] = registration_binning[dim] + 1
 
         spacings = [
             {
-                dim: spacings[isim][dim] * registration_binning[dim]
+                dim: input_spacings[isim][dim] * registration_binning[dim]
                 for dim in spatial_dims
             }
             for isim in range(2)
@@ -349,14 +352,27 @@ def phase_correlation_registration(fixed_data, moving_data, **kwargs):
         return [np.zeros(ndim)]
 
     for t_ in t_candidates:
-        im1t = ndimage.affine_transform(
-            im1 + 1,
-            param_utils.affine_from_translation(list(t_)),
-            order=1,
-            mode="constant",
-            cval=0,
-        )
-        mask = im1t > 0
+        # if im1 is unsigned integer, get mask by assuming there's
+        # no lower value than cval
+        is_unsigned_integer = np.issubdtype(im1.dtype, np.unsignedinteger)
+        if is_unsigned_integer:
+            im1t = ndimage.affine_transform(
+                im1,
+                param_utils.affine_from_translation(list(t_)),
+                order=1,
+                mode="constant",
+                cval=-1,
+            )
+            mask = im1t >= 0
+        else:  # transform to float otherwise
+            im1t = ndimage.affine_transform(
+                im1,
+                param_utils.affine_from_translation(list(t_)),
+                order=1,
+                mode="constant",
+                cval=np.nan,
+            )
+            mask = ~np.isnan(im1t)
 
         if float(np.sum(mask)) / np.prod(im1.shape) < 0.1:
             disambiguate_metric_val = -1
@@ -375,20 +391,27 @@ def phase_correlation_registration(fixed_data, moving_data, **kwargs):
             # correlation for disambiguation (need to solidify this)
             min_shape = np.min(im0[mask_slices].shape)
             ssim_win_size = np.min([7, min_shape - ((min_shape - 1) % 2)])
-            if ssim_win_size < 3 or np.max(im1t[mask_slices]) <= 1:
+            if (
+                ssim_win_size < 3
+                or (is_unsigned_integer and np.max(im1t[mask_slices]) <= 0)
+                or (
+                    not is_unsigned_integer
+                    and np.all(np.isnan(im1t[mask_slices]))
+                )
+            ):
+                logger.debug("SSIM window size too small")
                 disambiguate_metric_val = -1
             else:
                 disambiguate_metric_val = structural_similarity(
                     im0[mask_slices],
-                    im1t[mask_slices] - 1,
+                    im1t[mask_slices],
                     data_range=data_range,
                     win_size=ssim_win_size,
                 )
-
             # spearman seems to be better than structural_similarity
             # for filtering out bad links between views
             quality_metric_val = link_quality_metric_func(
-                im0[mask], im1t[mask] - 1
+                im0[mask], im1t[mask]
             )
 
         disambiguate_metric_vals.append(disambiguate_metric_val)
@@ -581,14 +604,15 @@ def register_pair_of_msims(
         reg_sims = [sim1, sim2]
 
     if registration_binning is None:
+        logger.info("Determining optimal registration binning")
         registration_binning = get_optimal_registration_binning(
             reg_sims[0], reg_sims[1]
         )
 
-    if (
-        registration_binning is not None
-        and max(registration_binning.values()) > 1
-    ):
+    # logging without use of %s
+    logger.info("Registration binning: %s", registration_binning)
+
+    if max(registration_binning.values()) > 1:
         reg_sims_b = [
             sim.coarsen(registration_binning, boundary="trim")
             .mean()
@@ -848,16 +872,17 @@ def groupwise_resolution_shortest_paths(g_reg, reference_view=None):
     into the coordinates of a new coordinate system.
     """
 
-    # ndim = msi_utils.get_ndim(g_reg.nodes[list(g_reg.nodes)[0]]["msim"])
     ndim = (
         g_reg.get_edge_data(*list(g_reg.edges())[0])["transform"].shape[-1] - 1
     )
 
     # use quality as weight in shortest path (mean over tp currently)
+    # make sure that quality is non-negative (shortest path algo requires this)
+    quality_min = np.min([g_reg.edges[e]["quality"] for e in g_reg.edges])
     for e in g_reg.edges:
         g_reg.edges[e]["quality_mean"] = np.mean(g_reg.edges[e]["quality"])
         g_reg.edges[e]["quality_mean_inv"] = 1 / (
-            g_reg.edges[e]["quality_mean"] + 0.5
+            (g_reg.edges[e]["quality_mean"] - quality_min) + 0.5
         )
 
     # get directed graph and invert transforms along edges
@@ -886,7 +911,6 @@ def groupwise_resolution_shortest_paths(g_reg, reference_view=None):
             )
 
         # get shortest paths to ref_node
-        # paths = nx.shortest_path(g_reg, source=ref_node, weight="overlap_inv")
         paths = {
             n: nx.shortest_path(
                 subgraph, target=n, source=ref_node, weight="quality_mean_inv"
@@ -895,7 +919,6 @@ def groupwise_resolution_shortest_paths(g_reg, reference_view=None):
         }
 
         for n in subgraph.nodes:
-            # reg_path = g_reg.nodes[n]["reg_path"]
             reg_path = paths[n]
 
             path_pairs = [
@@ -1191,12 +1214,16 @@ def optimize_bead_subgraph(
         - 1
     )
 
-    if transform == "translation":
+    if transform.lower() == "translation":
         transform_generator = TranslationTransform(dimensionality=ndim)
-    elif transform == "rigid":
+    elif transform.lower() == "rigid":
         transform_generator = EuclideanTransform(dimensionality=ndim)
-    elif transform == "affine":
+    elif transform.lower() == "affine":
         transform_generator = AffineTransform(dimensionality=ndim)
+    else:
+        raise ValueError(
+            f"Unknown transformation type in parameter resolution: {transform}"
+        )
 
     mean_residuals = []
     dfs = []
@@ -1543,20 +1570,25 @@ def register(
 
     sims = [msi_utils.get_sim_from_msim(msim) for msim in msims]
 
-    if reg_channel is None:
-        if reg_channel_index is None:
-            for msim in msims:
-                if "c" in msi_utils.get_dims(msim):
-                    raise (Exception("Please choose a registration channel."))
-        else:
-            reg_channel = sims[0].coords["c"][reg_channel_index]
+    if "c" in msi_utils.get_dims(msims[0]):
+        if reg_channel is None:
+            if reg_channel_index is None:
+                for msim in msims:
+                    if "c" in msi_utils.get_dims(msim):
+                        raise (
+                            Exception("Please choose a registration channel.")
+                        )
+            else:
+                reg_channel = sims[0].coords["c"][reg_channel_index]
 
-    msims_reg = [
-        msi_utils.multiscale_sel_coords(msim, {"c": reg_channel})
-        if "c" in msi_utils.get_dims(msim)
-        else msim
-        for imsim, msim in enumerate(msims)
-    ]
+        msims_reg = [
+            msi_utils.multiscale_sel_coords(msim, {"c": reg_channel})
+            if "c" in msi_utils.get_dims(msim)
+            else msim
+            for imsim, msim in enumerate(msims)
+        ]
+    else:
+        msims_reg = msims
 
     g = mv_graph.build_view_adjacency_graph_from_msims(
         msims_reg,
@@ -1625,7 +1657,7 @@ def register(
                 use_positional_colors=False,
             )
 
-    return params  # , groupwise_opt_info
+    return params
 
 
 def compute_pairwise_registrations(
@@ -1668,6 +1700,8 @@ def compute_pairwise_registrations(
         else:
             logger.info("Computing pairwise registrations in parallel")
             params = compute(params_xds, scheduler=scheduler)[0]
+    else:
+        params = compute(params_xds, scheduler=scheduler)[0]
 
     for i, pair in enumerate(edges):
         g_reg_computed.edges[pair]["transform"] = params[i]["transform"]
@@ -1768,6 +1802,30 @@ E.g. using pip:
     spatial_dims = fixed_data.dims
     ndim = len(fixed_spacing)
 
+    changed_units = False
+    # fixed_spacing_orig = fixed_spacing.copy()
+    # moving_spacing_orig = moving_spacing.copy()
+    # fixed_origin_orig = fixed_origin.copy()
+    # moving_origin_orig = moving_origin.copy()
+
+    # there's an ants problem with small spacings and mattes mutual information
+    # https://github.com/ANTsX/ANTs/issues/1348
+    if (
+        min(
+            [fixed_spacing[dim] for dim in spatial_dims]
+            + [moving_spacing[dim] for dim in spatial_dims]
+        )
+        < 1e-3
+    ):
+        logger.info("Scaling units for ANTsPy registration.")
+        changed_units = True
+        unit_scale_factor = 1e3
+        for dim in spatial_dims:
+            fixed_spacing[dim] = unit_scale_factor * fixed_spacing[dim]
+            moving_spacing[dim] = unit_scale_factor * moving_spacing[dim]
+            fixed_origin[dim] = unit_scale_factor * fixed_origin[dim]
+            moving_origin[dim] = unit_scale_factor * moving_origin[dim]
+
     # convert input images to ants images
     fixed_ants = ants.from_numpy(
         fixed_data.astype(np.float32),
@@ -1848,6 +1906,9 @@ E.g. using pip:
     p = param_utils.invert_coordinate_order(p)
 
     p = param_utils.affine_to_xaffine(p)
+
+    if changed_units:
+        p.data[:ndim, ndim] = p.data[:ndim, ndim] / unit_scale_factor
 
     quality = link_quality_metric_func(
         fixed_ants.numpy(), aff["warpedmovout"].numpy()
